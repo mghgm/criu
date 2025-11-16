@@ -256,9 +256,55 @@ static cuda_task_state_t get_cuda_state(pid_t pid)
 	return get_task_state_enum(state_str);
 }
 
+static long get_rss_kb_from_pagemap(pid_t pid)
+{
+    char maps_path[64], pagemap_path[64];
+    FILE *maps = nullptr;
+    int pm_fd = -1;
+
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
+
+    maps = fopen(maps_path, "r");
+    if (!maps)
+        return -1;
+
+    pm_fd = open(pagemap_path, O_RDONLY);
+    if (pm_fd < 0) {
+        fclose(maps);
+        return -1;
+    }
+
+    unsigned long page_size = getpagesize();
+    unsigned long start, end;
+    long rss_pages = 0;
+
+    while (fscanf(maps, "%lx-%lx%*[^\n]\n", &start, &end) == 2) {
+        for (unsigned long addr = start; addr < end; addr += page_size) {
+            uint64_t entry;
+            off_t off = (addr / page_size) * 8;
+
+            if (pread(pm_fd, &entry, sizeof(entry), off) != sizeof(entry))
+                continue;
+
+            if (entry & (1ULL << 63)) // present bit
+                rss_pages++;
+        }
+    }
+
+    fclose(maps);
+    close(pm_fd);
+
+    return (rss_pages * page_size) / 1024;
+}
+
+
 static int cuda_process_checkpoint_action(int pid, const char *action, unsigned int timeout, char *msg_buf,
 					  int buf_size)
 {
+	long mem_before = get_rss_kb_from_pagemap(pid);
+    pr_info("CUDA: PID %d RSS before: %ld KB\n", pid, mem_before);
+	
 	char pid_buf[16];
 	char timeout_buf[16];
 
@@ -272,7 +318,12 @@ static int cuda_process_checkpoint_action(int pid, const char *action, unsigned 
 		args[6] = timeout_buf;
 	}
 
-	return launch_cuda_checkpoint(args, msg_buf, buf_size);
+	int ret = launch_cuda_checkpoint(args, msg_buf, buf_size);
+
+    long mem_after = get_rss_kb_from_pagemap(pid);
+    pr_info("CUDA: PID %d RSS after : %ld KB\n", pid, mem_after);
+
+    return ret;
 }
 
 static int interrupt_restore_thread(int restore_tid, k_rtsigset_t *restore_sigset)
